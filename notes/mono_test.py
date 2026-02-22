@@ -7,6 +7,7 @@ At each time step, the evaluator consumes 4 input frames (1 second) and renders
 
 from __future__ import annotations
 import os, sys
+os.environ["CUDA_VISIBLE_DEVICES"] = "9"
 sys.path.append("/data0/xxy/code/MonoSplat/")
 sys.path.append("/data0/xxy/code/MonoSplat/src")
 import argparse
