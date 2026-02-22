@@ -6,7 +6,9 @@ At each time step, the evaluator consumes 4 input frames (1 second) and renders
 """
 
 from __future__ import annotations
-
+import os, sys
+sys.path.append("/data0/xxy/code/MonoSplat/")
+sys.path.append("/data0/xxy/code/MonoSplat/src")
 import argparse
 import json
 import time
