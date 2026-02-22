@@ -6,8 +6,8 @@ defaults:
   - loss: [mse]
 
 wandb:
-  project: anysplat
-  entity: vvvsice
+  project: depthsplat
+  entity: xxy
   name: placeholder
   mode: online
   id: null

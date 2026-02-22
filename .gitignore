@@ -178,3 +178,6 @@ table.tex
 /test/*
 point_clouds*
 assets/*_3views.json
+
+notes/
+agents/

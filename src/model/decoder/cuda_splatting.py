@@ -114,7 +114,7 @@ def render_cuda(
 
         row, col = torch.triu_indices(3, 3)
 
-        image, _, _, _, radii = rasterizer(
+        image, radii = rasterizer(
             means3D=gaussian_means[i],
             means2D=mean_gradients,
             shs=shs[i] if use_sh else None,
