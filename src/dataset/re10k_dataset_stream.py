@@ -1,15 +1,156 @@
-import torch
-import torchvision
-from torch.utils.data import Dataset
+from __future__ import annotations
+
 import json
-import numpy as np
 import os
 from io import BytesIO
-from PIL import Image
+from typing import Any
+
+import numpy as np
+import torch
+import torchvision
 import torchvision.transforms as tf
+from PIL import Image
+from torch.utils.data import Dataset
 
 # 数据集路径
 MY_DATA_ROOT = "/data0/xxy/data/re10k"
+
+
+def get_uniform_indices(pool_size: int, num_pick: int) -> np.ndarray:
+    """Pick `num_pick` indices from a pool of length `pool_size`.
+
+    For the common RE10K streaming setup we use pool_size=15 (odd frames within a
+    1-second window at 30fps). For that case we keep the original lookup-table
+    behavior to match the author's intended sampling.
+    """
+    if num_pick <= 0:
+        return np.array([], dtype=int)
+
+    if pool_size == 15:
+        if num_pick == 1:
+            return np.array([7], dtype=int)
+        if num_pick == 2:
+            return np.array([5, 9], dtype=int)
+        if num_pick == 3:
+            return np.array([3, 7, 11], dtype=int)
+        if num_pick == 4:
+            return np.array([3, 6, 8, 11], dtype=int)
+        if num_pick == 7:
+            return np.array([1, 3, 5, 7, 9, 11, 13], dtype=int)
+        if num_pick == 8:
+            return np.array([0, 2, 4, 6, 8, 10, 12, 14], dtype=int)
+
+    if num_pick >= pool_size:
+        return np.arange(pool_size, dtype=int)
+    return np.linspace(0, pool_size - 1, num_pick).astype(int)
+
+
+def pick_k(pool_array: np.ndarray, k: int) -> np.ndarray:
+    if len(pool_array) == 0 or k <= 0:
+        return np.array([], dtype=int)
+    indices = get_uniform_indices(len(pool_array), k)
+    return pool_array[indices]
+
+
+def build_re10k_stream_splits(
+    *,
+    num_frames: int,
+    input_num: int = 4,
+    num_seconds: int = 5,
+    fps: int = 30,
+    rng: np.random.Generator | None = None,
+) -> dict[str, Any] | None:
+    """Create per-second context indices and 5 streaming target sets.
+
+    Returns a dict with:
+      - input_indices_per_sec: list[np.ndarray] length=num_seconds
+      - pool_indices_per_sec: list[np.ndarray] length=num_seconds (odd frames)
+      - target_indices_per_step: list[np.ndarray] length=num_seconds (each len=15)
+
+    If the clip is too short (< num_seconds*fps), returns None.
+    """
+    if num_seconds != 5:
+        raise ValueError(
+            "build_re10k_stream_splits currently implements the fixed 5-second "
+            "(T1..T5) protocol; got num_seconds={num_seconds}."
+        )
+
+    if rng is None:
+        rng = np.random.default_rng()
+
+    min_len = num_seconds * fps
+    valid_len = min(num_frames, min_len)
+    if valid_len < min_len:
+        return None
+
+    inputs_per_sec: list[np.ndarray] = []
+    pools_per_sec: list[np.ndarray] = []
+
+    pool_pattern = np.arange(1, fps, 2, dtype=int)  # [1,3,...,fps-1] => 15 when fps=30
+
+    for sec in range(num_seconds):
+        start = sec * fps
+        end = min((sec + 1) * fps, valid_len)
+
+        local_pool = start + pool_pattern
+        local_pool = local_pool[local_pool < valid_len]
+        pools_per_sec.append(local_pool)
+
+        frame_count = end - start
+        if frame_count <= 0:
+            inputs_per_sec.append(np.array([], dtype=int))
+            continue
+
+        count = min(input_num, frame_count)
+        # Random within the second.
+        local_input = rng.choice(frame_count, count, replace=False)
+        local_input.sort()
+        inputs_per_sec.append(start + local_input)
+
+    # Targets follow the 1+2+4+8 aggregation logic.
+    final_targets: list[np.ndarray] = []
+    final_targets.append(pick_k(pools_per_sec[0], 15))
+    final_targets.append(
+        np.concatenate([pick_k(pools_per_sec[0], 7), pick_k(pools_per_sec[1], 8)])
+    )
+    final_targets.append(
+        np.concatenate(
+            [
+                pick_k(pools_per_sec[0], 3),
+                pick_k(pools_per_sec[1], 4),
+                pick_k(pools_per_sec[2], 8),
+            ]
+        )
+    )
+    final_targets.append(
+        np.concatenate(
+            [
+                pick_k(pools_per_sec[0], 1),
+                pick_k(pools_per_sec[1], 2),
+                pick_k(pools_per_sec[2], 4),
+                pick_k(pools_per_sec[3], 8),
+            ]
+        )
+    )
+    final_targets.append(
+        np.concatenate(
+            [
+                pick_k(pools_per_sec[1], 1),
+                pick_k(pools_per_sec[2], 2),
+                pick_k(pools_per_sec[3], 4),
+                pick_k(pools_per_sec[4], 8),
+            ]
+        )
+    )
+
+    return {
+        "input_indices_per_sec": inputs_per_sec,
+        "pool_indices_per_sec": pools_per_sec,
+        "target_indices_per_step": final_targets,
+        "valid_len": valid_len,
+        "fps": fps,
+        "num_seconds": num_seconds,
+    }
 
 class RE10KDataset(Dataset):
     def __init__(self, data_root=None, input_num=4):
@@ -49,46 +190,10 @@ class RE10KDataset(Dataset):
     # 15选7 -> [3, 7, 11, 15, 19, 23, 27] 
     # 15选8 -> [1, 5, 9, 13, 17, 21, 25, 29] 
     def get_uniform_indices(self, pool_size, num_pick):
-        """
-        查表法，直接返回预设答案。
-        """
-        if num_pick == 0:
-            return np.array([], dtype=int)
-            
-        # 针对 Pool Size = 15 
-        if pool_size == 15:
-            # 数字是 Pool 的索引 (0-14)
-            # 选1 -> Frame 15 -> Index 7
-            if num_pick == 1:
-                return np.array([7], dtype=int)
-                
-            # 选2 -> Frame 11, 19 -> Index 5, 9
-            if num_pick == 2:
-                return np.array([5, 9], dtype=int)
-                
-            # 选3 -> Frame 7, 15, 23 -> Index 3, 7, 11
-            if num_pick == 3:
-                return np.array([3, 7, 11], dtype=int)
-                
-            # 选4 -> Frame 7, 13, 17, 23 -> Index 3, 6, 8, 11
-            if num_pick == 4:
-                return np.array([3, 6, 8, 11], dtype=int)
-                
-            # 选7 -> Frame 3, 7, 11... 27 -> Index 1, 3, 5, 7, 9, 11, 13
-            if num_pick == 7:
-                return np.array([1, 3, 5, 7, 9, 11, 13], dtype=int)
-                
-            # 选8 -> Frame 1... 29 -> Index 0, 2, 4... 14
-            if num_pick == 8:
-                return np.array([0, 2, 4, 6, 8, 10, 12, 14], dtype=int)
-        if num_pick >= pool_size: return np.arange(pool_size)
-        return np.linspace(0, pool_size - 1, num_pick).astype(int)
+        return get_uniform_indices(pool_size, num_pick)
     
     def pick_k(self, pool_array, k):
-        # 从给定的 pool_array 中挑选 k 个索引
-        if len(pool_array) == 0: return np.array([], dtype=int)
-        indices = self.get_uniform_indices(len(pool_array), k)
-        return pool_array[indices]
+        return pick_k(pool_array, k)
 
     # 解码函数
     def convert_images(self, raw_images_list):
