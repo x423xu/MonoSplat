@@ -11,6 +11,9 @@ from .mv_transformer import (
 )
 from .utils import mv_feature_add_position
 
+TIMER = True
+if TIMER:
+    import time
 
 def warp_with_pose_depth_candidates(
     feature1,
@@ -141,13 +144,17 @@ class DepthPredictorMultiView(nn.Module):
         self.regressor_feat_dim = costvolume_unet_feat_dim
         self.upscale_factor = upscale_factor
         self.feature_channels = feature_channels
+        self.use_da3 = kwargs.get("use_da3", False)
         
         # Fixed feature extractor and trained cost head
         self.vit_type = "vits"  # can also be 'vitb' or 'vitl'
-        self.pretrained = torch.hub.load(
-            "facebookresearch/dinov2", "dinov2_{:}14".format(self.vit_type)
-        )
-        del self.pretrained.mask_token  # unused
+        if self.use_da3:
+            pass
+        else:
+            self.pretrained = torch.hub.load(
+                "facebookresearch/dinov2", "dinov2_{:}14".format(self.vit_type)
+            )
+            del self.pretrained.mask_token  # unused
         for param in self.pretrained.parameters():
             param.requires_grad = False
         
@@ -198,6 +205,8 @@ class DepthPredictorMultiView(nn.Module):
                 postnorm=True,
                 num_frames=num_views,
                 use_cross_view_self_attn=True,
+                use_new_attention_order=True,
+                use_sdpa_qkv=True,
             ),
             nn.Conv2d(channels, num_depth_candidates, 3, 1, 1))
             # cost volume u-net skip connection
@@ -234,6 +243,8 @@ class DepthPredictorMultiView(nn.Module):
                 postnorm=True,
                 num_frames=num_views,
                 use_cross_view_self_attn=True,
+                use_new_attention_order=True,
+                use_sdpa_qkv=True,
             ),
         )
 
@@ -277,7 +288,9 @@ class DepthPredictorMultiView(nn.Module):
         gaussians_per_pixel=1,
         deterministic=True,
     ):
-
+        if TIMER:
+            total_start = time.time()
+            dino_start = time.time()
         num_reference_views = 1
         # find nearest idxs
         cam_origins = extrinsics[:, :, :3, -1]  # [b, v, 3]
@@ -295,6 +308,9 @@ class DepthPredictorMultiView(nn.Module):
         features = self.pretrained.get_intermediate_layers(concat, 
                                                            self.intermediate_layer_idx[self.vit_type], 
                                                            return_class_token=True)
+        if TIMER:
+            dino_elapsed = time.time() - dino_start
+            dpt_start = time.time()
         # new decoder
         features_mono, disps_rel = self.depth_head(features, patch_h=resize_h // 14, patch_w=resize_w // 14)
         features_mv = self.cost_head(features, patch_h=resize_h // 14, patch_w=resize_w // 14)
@@ -302,13 +318,18 @@ class DepthPredictorMultiView(nn.Module):
         features_mv = F.interpolate(features_mv, (64, 64), mode="bilinear", align_corners=True)
         features_mv = mv_feature_add_position(features_mv, 2, 64)
         features_mv_list = list(torch.unbind(rearrange(features_mv, "(b v) c h w -> b v c h w", b=b, v=v), dim=1))
+        if TIMER:
+            dpt_elapsed = time.time() - dpt_start
+            transformer_start = time.time()
         features_mv_list = self.transformer(
             features_mv_list,
             attn_num_splits=2,
             nn_matrix=idx,
         )
         features_mv = rearrange(torch.stack(features_mv_list, dim=1), "b v c h w -> (b v) c h w")  # [BV, C, H, W]
-        
+        if TIMER:
+            transformer_elapsed = time.time() - transformer_start
+            cost_volume_start = time.time()
         # cost volume construction
         features_mv_warped, intr_warped, poses_warped = (
             prepare_feat_proj_data_lists(
@@ -337,6 +358,9 @@ class DepthPredictorMultiView(nn.Module):
             raw_correlation_in.append(raw_correlation_in_i)
         raw_correlation_in = torch.mean(torch.stack(raw_correlation_in, dim=1), dim=1)  # [B*V, D, H, W]
         
+        if TIMER:
+            cost_volume_elapsed = time.time() - cost_volume_start
+            refine1_start = time.time()
         # refine cost volume and get depths
         features_mono_tmp = F.interpolate(features_mono, (64, 64), mode="bilinear", align_corners=True)
         raw_correlation_in = torch.cat((raw_correlation_in, features_mv, features_mono_tmp), dim=1)
@@ -348,6 +372,9 @@ class DepthPredictorMultiView(nn.Module):
         pdf_max = F.interpolate(pdf_max, (ori_h, ori_w), mode="bilinear", align_corners=True)
         disps_metric_fullres = F.interpolate(disps_metric, (ori_h, ori_w), mode="bilinear", align_corners=True)
 
+        if TIMER:
+            refine1_elapsed = time.time() - refine1_start
+            refine2_start = time.time()
         # feature refinement
         features_mv_in_fullres = F.interpolate(features_mv, (ori_h, ori_w), mode="bilinear", align_corners=True)
         features_mv_in_fullres = self.proj_feature_mv(features_mv_in_fullres)
@@ -396,6 +423,29 @@ class DepthPredictorMultiView(nn.Module):
         )
         
         raw_gaussians = rearrange(raw_gaussians, "(b v) c h w -> b v (h w) c", v=v, b=b)
-
+        if TIMER:
+            refine2_elapsed = time.time() - refine2_start
+            total_elapsed = time.time() - total_start
+            print(f"DINO feature extraction took {dino_elapsed:.2f} seconds.")
+            print(f"DPT decoding took {dpt_elapsed:.2f} seconds.")
+            print(f"Transformer time: {transformer_elapsed:.2f} seconds.")
+            print(f"Cost volume construction time: {cost_volume_elapsed:.2f} seconds.")
+            print(f"Cost volume refinement time: {refine1_elapsed:.2f} seconds.")
+            print(f"Refinement time: {refine2_elapsed:.2f} seconds.")
+            print(f"Total depth prediction time: {total_elapsed:.2f} seconds.")
+            percents = []
+            if total_elapsed > 0:
+                percents.append((dino_elapsed / total_elapsed) * 100)
+                percents.append((dpt_elapsed / total_elapsed) * 100)
+                percents.append((transformer_elapsed / total_elapsed) * 100)
+                percents.append((cost_volume_elapsed / total_elapsed) * 100)
+                percents.append((refine1_elapsed / total_elapsed) * 100)
+                percents.append((refine2_elapsed / total_elapsed) * 100)
+                print(f"DINO feature extraction took {percents[0]:.1f}% of the time.")
+                print(f"DPT decoding took {percents[1]:.1f}% of the time.")
+                print(f"Transformer took {percents[2]:.1f}% of the time.")
+                print(f"Cost volume construction took {percents[3]:.1f}% of the time.")
+                print(f"Cost volume refinement took {percents[4]:.1f}% of the time.")
+                print(f"Refinement took {percents[5]:.1f}% of the time.")
         
         return depths, densities, raw_gaussians 

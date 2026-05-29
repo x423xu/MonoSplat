@@ -12,7 +12,7 @@ CUDA_VISIBLE_DEVICES=0 python -m src.main +experiment=re10k \
 CUDA_VISIBLE_DEVICES=0 python -m src.main +experiment=re10k \
     mode=test \
     dataset/view_sampler=evaluation \
-    checkpointing.load=/path/to/checkpoint \
+    checkpointing.load=/data0/xxy/code/MonoSplat/outputs/2026-02-10/13-21-17/checkpoints/epoch_9-step_300000.ckpt \
     dataset.view_sampler.index_path=assets/evaluation_index_re10k_nctx2.json \
     test.compute_scores=true \
     wandb.mode=disabled

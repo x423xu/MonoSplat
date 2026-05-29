@@ -25,6 +25,9 @@ from ...global_cfg import get_cfg
 from .epipolar.epipolar_sampler import EpipolarSampler
 from ..encodings.positional_encoding import PositionalEncoding
 
+TIMER =False
+if TIMER:
+    import time
 
 @dataclass
 class OpacityMappingCfg:
@@ -116,6 +119,9 @@ class EncoderCostVolume(Encoder[EncoderCostVolumeCfg]):
         device = context["image"].device
         b, v, _, h, w = context["image"].shape
 
+        if TIMER:
+            total_start = time.time()
+            depth_start = time.time()
         # Sample depths from the resulting features.
         gpp = self.cfg.gaussians_per_pixel
         depths, densities, raw_gaussians = self.depth_predictor(
@@ -127,7 +133,10 @@ class EncoderCostVolume(Encoder[EncoderCostVolumeCfg]):
             gaussians_per_pixel=gpp,
             deterministic=deterministic,
         )
-
+        if TIMER:
+            depth_elapsed = time.time() - depth_start
+            print(f"Depth prediction took {depth_elapsed:.2f} seconds.")
+            gs_cuda_start = time.time()
         # Convert the features and depths into Gaussians.
         xy_ray, _ = sample_image_grid((h, w), device)
         xy_ray = rearrange(xy_ray, "h w xy -> (h w) () xy")
@@ -152,7 +161,17 @@ class EncoderCostVolume(Encoder[EncoderCostVolumeCfg]):
             ),
             (h, w),
         )
-
+        if TIMER:
+            gs_cuda_elapsed = time.time() - gs_cuda_start
+            total_elapsed = time.time() - total_start
+            print(f"Gaussian conversion took {gs_cuda_elapsed:.2f} seconds.")
+            print(f"Total encoder forward took {total_elapsed:.2f} seconds.")
+            percents = []
+            if total_elapsed > 0:
+                percents.append((depth_elapsed / total_elapsed) * 100)
+                percents.append((gs_cuda_elapsed / total_elapsed) * 100)
+                print(f"Depth prediction took {percents[0]:.1f}% of the time.")
+                print(f"Gaussian conversion took {percents[1]:.1f}% of the time.")
         # Dump visualizations if needed.
         if visualization_dump is not None:
             visualization_dump["depth"] = rearrange(

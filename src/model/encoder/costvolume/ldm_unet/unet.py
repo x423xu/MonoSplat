@@ -321,6 +321,7 @@ class AttentionBlock(nn.Module):
         num_head_channels=-1,
         use_checkpoint=False,
         use_new_attention_order=False,
+        use_sdpa_qkv=False,
         postnorm=False,
         channels_per_group=None,
         num_frames=2,
@@ -341,13 +342,21 @@ class AttentionBlock(nn.Module):
         self.qkv = conv_nd(1, channels, channels * 3, 1)
         if use_new_attention_order:
             # split qkv before split heads
-            self.attention = QKVAttention(self.num_heads)
+            self.attention = QKVAttentionSDPA(self.num_heads) if use_sdpa_qkv else QKVAttention(self.num_heads)
         else:
             # split heads before split qkv
-            self.attention = QKVAttentionLegacy(
-                self.num_heads,
-                n_frames=num_frames,
-                use_cross_view_self_attn=use_cross_view_self_attn,
+            self.attention = (
+                QKVAttentionLegacySDPA(
+                    self.num_heads,
+                    n_frames=num_frames,
+                    use_cross_view_self_attn=use_cross_view_self_attn,
+                )
+                if use_sdpa_qkv
+                else QKVAttentionLegacy(
+                    self.num_heads,
+                    n_frames=num_frames,
+                    use_cross_view_self_attn=use_cross_view_self_attn,
+                )
             )
 
         if postnorm:
@@ -395,6 +404,7 @@ class CrossAttentionBlock(nn.Module):
         num_heads=8,
         proj_channels=512,
         num_views=3,
+        use_sdpa=False,
         num_head_channels=-1,
         use_checkpoint=False,
         use_new_attention_order=False,
@@ -409,6 +419,7 @@ class CrossAttentionBlock(nn.Module):
         self.num_head = num_heads
         self.num_views = num_views
         self.proj_channels = proj_channels
+        self.use_sdpa = use_sdpa
         self.with_norm = with_norm
         self.tanh_gating = tanh_gating
         self.ffn_after_cross_attn = ffn_after_cross_attn
@@ -467,20 +478,29 @@ class CrossAttentionBlock(nn.Module):
 
         if self.num_head > 1:
             assert c % self.num_head == 0
-            q = q.view(b * d, lx, self.num_head, c // self.num_head)  # [B*D, H*W, N, C]
-            k = k.view(b * d, ly, self.num_head, c // self.num_head)  # [B*D, H*W, N, C]
-            v = v.view(b * d, ly, self.num_head, c // self.num_head)  # [B*D, H*W, N, C]
+            head_dim = c // self.num_head
+            q = q.view(b * d, lx, self.num_head, head_dim).permute(0, 2, 1, 3)  # [B*D, N, Lx, C]
+            k = k.view(b * d, ly, self.num_head, head_dim).permute(0, 2, 1, 3)  # [B*D, N, Ly, C]
+            v = v.view(b * d, ly, self.num_head, head_dim).permute(0, 2, 1, 3)  # [B*D, N, Ly, C]
 
-            scores = torch.matmul(q.permute(0, 2, 1, 3), k.permute(0, 2, 3, 1)) / ((c // self.num_head) ** 0.5)  # [B*D, N, H*W, H*W]
-            prob = torch.softmax(scores, dim=-1)
-            out = torch.matmul(prob, v.permute(0, 2, 1, 3))  # [B*D, H*W, N, C]
-            out = out.view(b * d, lx, -1)  # [B*D, H*W, C]
+            if self.use_sdpa:
+                out = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False)
+            else:
+                scores = torch.matmul(q, k.transpose(-2, -1)) / (head_dim ** 0.5)  # [B*D, N, Lx, Ly]
+                prob = torch.softmax(scores, dim=-1)
+                out = torch.matmul(prob, v)  # [B*D, N, Lx, C]
+
+            out = out.permute(0, 2, 1, 3).reshape(b * d, lx, -1)  # [B*D, Lx, C]
 
         else:
-            scores = torch.matmul(q, k.permute(0, 2, 1)) / (c ** 0.5)  # [B*D, H*W, H*W]
-            prob = torch.softmax(scores, dim=-1)
-
-            out = torch.matmul(prob, v)  # [B*D, H*W, C]
+            if self.use_sdpa:
+                out = F.scaled_dot_product_attention(
+                    q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1), attn_mask=None, dropout_p=0.0, is_causal=False
+                ).squeeze(1)
+            else:
+                scores = torch.matmul(q, k.permute(0, 2, 1)) / (c ** 0.5)  # [B*D, Lx, Ly]
+                prob = torch.softmax(scores, dim=-1)
+                out = torch.matmul(prob, v)  # [B*D, Lx, C]
 
         out = out.view(b, d, h, w, c).permute(0, 4, 1, 2, 3)  # [B, C, D, H, W]
 
@@ -569,6 +589,44 @@ class QKVAttentionLegacy(nn.Module):
         return count_flops_attn(model, _x, y)
 
 
+class QKVAttentionLegacySDPA(nn.Module):
+    """
+    A module which performs QKV attention. Matches legacy QKVAttention + input/ouput heads shaping,
+    but uses torch.nn.functional.scaled_dot_product_attention.
+    """
+
+    def __init__(self, n_heads, n_frames=2, use_cross_view_self_attn=False):
+        super().__init__()
+        self.n_heads = n_heads
+        self.n_frames = n_frames
+        self.use_cross_view_self_attn = use_cross_view_self_attn
+
+    def forward(self, qkv):
+        if self.use_cross_view_self_attn:
+            qkv = rearrange(qkv, "(v b) n t -> b n (v t)", v=self.n_frames)
+
+        bs, width, length = qkv.shape
+        assert width % (3 * self.n_heads) == 0
+        ch = width // (3 * self.n_heads)
+        q, k, v = qkv.reshape(bs * self.n_heads, ch * 3, length).split(ch, dim=1)
+
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        a = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False)
+        a = a.transpose(1, 2).reshape(bs, -1, length)
+
+        if self.use_cross_view_self_attn:
+            a = rearrange(a, "b n (v t) -> (v b) n t", v=self.n_frames)
+
+        return a
+
+    @staticmethod
+    def count_flops(model, _x, y):
+        return count_flops_attn(model, _x, y)
+
+
 class QKVAttention(nn.Module):
     """
     A module which performs QKV attention and splits in a different order.
@@ -597,6 +655,43 @@ class QKVAttention(nn.Module):
         weight = th.softmax(weight.float(), dim=-1).type(weight.dtype)
         a = th.einsum("bts,bcs->bct", weight, v.reshape(bs * self.n_heads, ch, length))
         return a.reshape(bs, -1, length)
+
+    @staticmethod
+    def count_flops(model, _x, y):
+        return count_flops_attn(model, _x, y)
+
+
+class QKVAttentionSDPA(nn.Module):
+    """
+    A module which performs QKV attention using torch.nn.functional.scaled_dot_product_attention.
+    Input/output shapes match QKVAttention.
+    """
+
+    def __init__(self, n_heads):
+        super().__init__()
+        self.n_heads = n_heads
+
+    def forward(self, qkv):
+        """
+        Apply QKV attention.
+        :param qkv: an [N x (3 * H * C) x T] tensor of Qs, Ks, and Vs.
+        :return: an [N x (H * C) x T] tensor after attention.
+        """
+        bs, width, length = qkv.shape
+        assert width % (3 * self.n_heads) == 0
+        ch = width // (3 * self.n_heads)
+
+        q, k, v = qkv.chunk(3, dim=1)
+
+        # [N, H, T, C]
+        q = q.view(bs, self.n_heads, ch, length).permute(0, 1, 3, 2)
+        k = k.view(bs, self.n_heads, ch, length).permute(0, 1, 3, 2)
+        v = v.view(bs, self.n_heads, ch, length).permute(0, 1, 3, 2)
+
+        a = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False)
+
+        # Back to [N, H*C, T]
+        return a.permute(0, 1, 3, 2).reshape(bs, -1, length)
 
     @staticmethod
     def count_flops(model, _x, y):
@@ -661,6 +756,7 @@ class UNetModel(nn.Module):
         use_scale_shift_norm=False,
         resblock_updown=False,
         use_new_attention_order=False,
+        use_sdpa_qkv=False,
         use_spatial_transformer=False,  # custom transformer support
         transformer_depth=1,  # custom transformer support
         context_dim=None,  # custom transformer support
@@ -775,6 +871,7 @@ class UNetModel(nn.Module):
                                 num_heads=num_heads,
                                 num_head_channels=dim_head,
                                 use_new_attention_order=use_new_attention_order,
+                                use_sdpa_qkv=use_sdpa_qkv,
                                 postnorm=False if attn_prenorm else postnorm,
                                 channels_per_group=channels_per_group,
                                 num_frames=num_frames,
@@ -797,6 +894,7 @@ class UNetModel(nn.Module):
                             num_heads=8,
                             proj_channels=512,
                             num_views=condition_num_views,
+                            use_sdpa=use_sdpa_qkv,
                             with_norm=cross_attn_with_norm,
                             tanh_gating=tanh_gating,
                             ffn_after_cross_attn=ffn_after_cross_attn,
@@ -865,6 +963,7 @@ class UNetModel(nn.Module):
                         num_heads=num_heads,
                         num_head_channels=dim_head,
                         use_new_attention_order=use_new_attention_order,
+                        use_sdpa_qkv=use_sdpa_qkv,
                         postnorm=False if attn_prenorm else postnorm,
                         channels_per_group=channels_per_group,
                         num_frames=num_frames,
@@ -887,6 +986,7 @@ class UNetModel(nn.Module):
                         num_heads=8,
                         proj_channels=512,
                         num_views=condition_num_views,
+                        use_sdpa=use_sdpa_qkv,
                         with_norm=cross_attn_with_norm,
                         tanh_gating=tanh_gating,
                         ffn_after_cross_attn=ffn_after_cross_attn,
@@ -950,6 +1050,7 @@ class UNetModel(nn.Module):
                     num_heads=8,
                     proj_channels=512,
                     num_views=condition_num_views,
+                    use_sdpa=use_sdpa_qkv,
                     with_norm=cross_attn_with_norm,
                     tanh_gating=tanh_gating,
                     ffn_after_cross_attn=ffn_after_cross_attn,
@@ -1005,6 +1106,7 @@ class UNetModel(nn.Module):
                                 num_heads=num_heads_upsample,
                                 num_head_channels=dim_head,
                                 use_new_attention_order=use_new_attention_order,
+                                use_sdpa_qkv=use_sdpa_qkv,
                                 postnorm=False if attn_prenorm else postnorm,
                                 channels_per_group=channels_per_group,
                                 num_frames=num_frames,
@@ -1027,6 +1129,7 @@ class UNetModel(nn.Module):
                             num_heads=8,
                             proj_channels=512,
                             num_views=condition_num_views,
+                            use_sdpa=use_sdpa_qkv,
                             with_norm=cross_attn_with_norm,
                             tanh_gating=tanh_gating,
                             ffn_after_cross_attn=ffn_after_cross_attn,
@@ -1186,6 +1289,7 @@ class StackUNet(nn.Module):
                 no_self_attn=False,
                 middle_block_no_identity=False,
                 conv_kernel_size=3,
+                 use_sdpa_qkv=False,
                  ):
 
         super().__init__()
@@ -1221,6 +1325,7 @@ class StackUNet(nn.Module):
                             condition_num_views=condition_num_views,
                             no_self_attn=no_self_attn,
                             conv_kernel_size=conv_kernel_size,
+                            use_sdpa_qkv=use_sdpa_qkv,
                             )
             )
 

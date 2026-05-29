@@ -1,5 +1,5 @@
 
-CUDA_VISIBLE_DEVICES=8 python -m src.main \
+CUDA_VISIBLE_DEVICES=9 python -m src.main \
     +experiment=re10k \
     checkpointing.pretrained_monodepth=pretrained/depth_anything_v2_vits.pth \
     dataset.roots=[/data0/xxy/data/re10k]\

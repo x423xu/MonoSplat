@@ -41,7 +41,9 @@ from .decoder.decoder import Decoder, DepthRenderingMode
 from .encoder import Encoder
 from .encoder.visualization.encoder_visualizer import EncoderVisualizer
 
-
+TIMER=False
+if TIMER:
+    import time
 @dataclass
 class OptimizerCfg:
     lr: float
@@ -182,12 +184,19 @@ class ModelWrapper(LightningModule):
         assert b == 1
 
         # Render Gaussians.
+        if TIMER:
+            encode_start = time.time()
+            total_start = time.time()
         with self.benchmarker.time("encoder"):
             gaussians = self.encoder(
                 batch["context"],
                 self.global_step,
                 deterministic=False,
             )
+        if TIMER:
+            encode_elapsed = time.time() - encode_start
+            print(f"Encoding took {encode_elapsed:.2f} seconds.")
+            decode_start = time.time()
         with self.benchmarker.time("decoder", num_calls=v):
             output = self.decoder.forward(
                 gaussians,
@@ -198,7 +207,15 @@ class ModelWrapper(LightningModule):
                 (h, w),
                 depth_mode=None,
             )
-
+        if TIMER:
+            total_elapsed = time.time() - total_start
+            decode_elapsed = time.time() - decode_start
+            print(f"Decoding took {decode_elapsed:.2f} seconds.")
+            print(f"Total encoding + decoding took {total_elapsed:.2f} seconds.")
+            percent_encode = encode_elapsed / total_elapsed * 100
+            percent_decode = decode_elapsed / total_elapsed * 100
+            print(f"Percent encoding: {percent_encode:.2f}%; Percent decoding: {percent_decode:.2f}%")
+            
         (scene,) = batch["scene"]
         name = get_cfg()["wandb"]["name"]
         path = self.test_cfg.output_path / name

@@ -147,7 +147,9 @@ def train(cfg_dict: DictConfig):
             pretrained_model = torch.load(cfg.checkpointing.pretrained_monodepth, map_location='cpu')
             if 'state_dict' in pretrained_model:
                 pretrained_model = pretrained_model['state_dict']
-
+            for k,v in pretrained_model.items():
+                print(k, v.shape)
+            raise NotImplementedError("Loading pretrained monodepth is not implemented yet.")
             model_wrapper.encoder.depth_predictor.load_state_dict(pretrained_model, strict=strict_load)
             print(cyan(f"Loaded pretrained monodepth: {cfg.checkpointing.pretrained_monodepth}"))
             
