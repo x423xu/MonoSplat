@@ -91,6 +91,7 @@ class EncoderCostVolume(Encoder[EncoderCostVolumeCfg]):
             wo_depth_refine=cfg.wo_depth_refine,
             wo_cost_volume=cfg.wo_cost_volume,
             wo_cost_volume_refine=cfg.wo_cost_volume_refine,
+            use_da3=True,
         )
 
     def map_pdf_to_opacity(

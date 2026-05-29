@@ -11,7 +11,7 @@ from .mv_transformer import (
 )
 from .utils import mv_feature_add_position
 
-TIMER = True
+TIMER = False
 if TIMER:
     import time
 
@@ -148,30 +148,40 @@ class DepthPredictorMultiView(nn.Module):
         
         # Fixed feature extractor and trained cost head
         self.vit_type = "vits"  # can also be 'vitb' or 'vitl'
+        da3_model_names = {
+            "vits": 'depth-anything/DA3-SMALL',
+            "vitb": 'depth-anything/DA3-BASE',
+            "vitl": 'depth-anything/DA3-BASE',
+        }
         if self.use_da3:
-            pass
+            from depth_anything_3.api import DepthAnything3
+            self.pretrained = DepthAnything3.from_pretrained(da3_model_names[self.vit_type])
+            for param in self.pretrained.parameters():
+                param.requires_grad = False
         else:
             self.pretrained = torch.hub.load(
                 "facebookresearch/dinov2", "dinov2_{:}14".format(self.vit_type)
             )
             del self.pretrained.mask_token  # unused
-        for param in self.pretrained.parameters():
-            param.requires_grad = False
+            self.depth_head = DPTHead(self.pretrained.embed_dim, 
+                                  features=feature_channels, 
+                                  use_bn=False, 
+                                  out_channels=[48, 96, 192, 384], 
+                                  use_clstoken=False)
+            for param in self.pretrained.parameters():
+                param.requires_grad = False
+            for param in self.depth_head.parameters():
+                param.requires_grad = False
+           
         
         self.intermediate_layer_idx = {
             "vits": [2, 5, 8, 11],
             "vitb": [2, 5, 8, 11],
             "vitl": [4, 11, 17, 23],
         }
-        self.depth_head = DPTHead(self.pretrained.embed_dim, 
-                                  features=feature_channels, 
-                                  use_bn=False, 
-                                  out_channels=[48, 96, 192, 384], 
-                                  use_clstoken=False)
-        for param in self.depth_head.parameters():
-            param.requires_grad = False
         
-        self.cost_head = CostHead(self.pretrained.embed_dim, 
+                
+        self.cost_head = CostHead(2*self.pretrained.model.backbone.pretrained.embed_dim if self.use_da3 else self.pretrained.embed_dim, 
                                   features=feature_channels, 
                                   use_bn=False, 
                                   out_channels=[48, 96, 192, 384], 
@@ -303,17 +313,44 @@ class DepthPredictorMultiView(nn.Module):
         
         # depth anything encoder
         resize_h, resize_w = ori_h // 14 * 14, ori_w // 14 * 14
-        concat = rearrange(images, "b v c h w -> (b v) c h w")
-        concat = F.interpolate(concat, (resize_h, resize_w), mode="bilinear", align_corners=True)
-        features = self.pretrained.get_intermediate_layers(concat, 
-                                                           self.intermediate_layer_idx[self.vit_type], 
-                                                           return_class_token=True)
+        
+        if self.use_da3:
+            concat = rearrange(images, "b v c h w -> (b v) c h w")
+            concat = F.interpolate(concat, (resize_h, resize_w), mode="bilinear", align_corners=True)
+            concat = rearrange(concat, "(b v) c h w -> b v c h w", b=b, v=v)
+            features, aux_features = self.pretrained.model.backbone(
+                                                    concat,
+                                                    cam_token=None,
+                                                    export_feat_layers=[],
+                                                    ref_view_strategy="saddle_balanced",
+                                                )
+            
+        else:
+            concat = rearrange(images, "b v c h w -> (b v) c h w")
+            concat = F.interpolate(concat, (resize_h, resize_w), mode="bilinear", align_corners=True)
+            features = self.pretrained.get_intermediate_layers(concat, 
+                                                            self.intermediate_layer_idx[self.vit_type], 
+                                                            return_class_token=True)
         if TIMER:
             dino_elapsed = time.time() - dino_start
             dpt_start = time.time()
         # new decoder
-        features_mono, disps_rel = self.depth_head(features, patch_h=resize_h // 14, patch_w=resize_w // 14)
-        features_mv = self.cost_head(features, patch_h=resize_h // 14, patch_w=resize_w // 14)
+        if self.use_da3:
+            output = self.pretrained.model.head(
+                features,
+                resize_h,
+                resize_w,
+                patch_start_idx=0,
+            )
+            features_mono = output['main_hidden'] # b v c h w
+            depth = output['depth'] # b v h w
+            features_mono = rearrange(features_mono, "b v c h w -> (b v) c h w")
+            disps_rel = rearrange(1.0 / (depth+1e-8), "b v h w -> (b v) () h w")
+            features_reshape = [[rearrange(f[0], "b v n l -> (b v) n l"), rearrange(f[1], "b v l -> (b v) l")] for f in features]
+            features_mv = self.cost_head(features_reshape, patch_h=resize_h // 14, patch_w=resize_w // 14)
+        else:
+            features_mono, disps_rel = self.depth_head(features, patch_h=resize_h // 14, patch_w=resize_w // 14)
+            features_mv = self.cost_head(features, patch_h=resize_h // 14, patch_w=resize_w // 14)
         
         features_mv = F.interpolate(features_mv, (64, 64), mode="bilinear", align_corners=True)
         features_mv = mv_feature_add_position(features_mv, 2, 64)
