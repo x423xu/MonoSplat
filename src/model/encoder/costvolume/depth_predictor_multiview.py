@@ -158,6 +158,7 @@ class DepthPredictorMultiView(nn.Module):
             self.pretrained = DepthAnything3.from_pretrained(da3_model_names[self.vit_type])
             for param in self.pretrained.parameters():
                 param.requires_grad = False
+            print("Using Depth Anything 3 backbone with frozen weights.")
         else:
             self.pretrained = torch.hub.load(
                 "facebookresearch/dinov2", "dinov2_{:}14".format(self.vit_type)
@@ -463,13 +464,7 @@ class DepthPredictorMultiView(nn.Module):
         if TIMER:
             refine2_elapsed = time.time() - refine2_start
             total_elapsed = time.time() - total_start
-            print(f"DINO feature extraction took {dino_elapsed:.2f} seconds.")
-            print(f"DPT decoding took {dpt_elapsed:.2f} seconds.")
-            print(f"Transformer time: {transformer_elapsed:.2f} seconds.")
-            print(f"Cost volume construction time: {cost_volume_elapsed:.2f} seconds.")
-            print(f"Cost volume refinement time: {refine1_elapsed:.2f} seconds.")
-            print(f"Refinement time: {refine2_elapsed:.2f} seconds.")
-            print(f"Total depth prediction time: {total_elapsed:.2f} seconds.")
+            
             percents = []
             if total_elapsed > 0:
                 percents.append((dino_elapsed / total_elapsed) * 100)
@@ -478,11 +473,12 @@ class DepthPredictorMultiView(nn.Module):
                 percents.append((cost_volume_elapsed / total_elapsed) * 100)
                 percents.append((refine1_elapsed / total_elapsed) * 100)
                 percents.append((refine2_elapsed / total_elapsed) * 100)
-                print(f"DINO feature extraction took {percents[0]:.1f}% of the time.")
-                print(f"DPT decoding took {percents[1]:.1f}% of the time.")
-                print(f"Transformer took {percents[2]:.1f}% of the time.")
-                print(f"Cost volume construction took {percents[3]:.1f}% of the time.")
-                print(f"Cost volume refinement took {percents[4]:.1f}% of the time.")
-                print(f"Refinement took {percents[5]:.1f}% of the time.")
+                print(f"DINO feature extraction took {dino_elapsed:.4f} seconds: {percents[0]:.1f}% of the time.")
+                print(f"DPT decoding took {dpt_elapsed:.4f} seconds: {percents[1]:.1f}% of the time.")
+                print(f"Transformer time: {transformer_elapsed:.4f} seconds: {percents[2]:.1f}% of the time.")
+                print(f"Cost volume construction time: {cost_volume_elapsed:.4f} seconds: {percents[3]:.1f}% of the time.")
+                print(f"Cost volume refinement time: {refine1_elapsed:.4f} seconds: {percents[4]:.1f}% of the time.")
+                print(f"Refinement time: {refine2_elapsed:.4f} seconds: {percents[5]:.1f}% of the time.")
+                print(f"Total depth prediction time: {total_elapsed:.4f} seconds.")
         
         return depths, densities, raw_gaussians 

@@ -18,6 +18,7 @@ near: -1.
 far: -1.
 baseline_scale_bounds: true
 shuffle_val: true
+use_da3_pose: false
 test_len: -1
 test_chunk_interval: 1
 test_times_per_scene: 1

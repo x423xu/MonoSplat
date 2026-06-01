@@ -37,6 +37,7 @@ from ..visualization.color_map import apply_color_map_to_image
 from ..visualization.layout import add_border, hcat, vcat
 from ..visualization import layout
 from ..visualization.validation_in_3d import render_cameras, render_projections
+from .da3_pose_utils import replace_batch_poses_from_da3
 from .decoder.decoder import Decoder, DepthRenderingMode
 from .encoder import Encoder
 from .encoder.visualization.encoder_visualizer import EncoderVisualizer
@@ -113,6 +114,7 @@ class ModelWrapper(LightningModule):
         self.decoder = decoder
         self.data_shim = get_data_shim(self.encoder)
         self.losses = nn.ModuleList(losses)
+        self._da3_pose_model_holder: list[nn.Module] = []
 
         # This is used for testing.
         self.benchmarker = Benchmarker()
@@ -122,8 +124,55 @@ class ModelWrapper(LightningModule):
             self.test_step_outputs = {}
             self.time_skip_steps_dict = {"encoder": 0, "decoder": 0}
 
+    def use_da3_pose(self) -> bool:
+        cfg = get_cfg()
+        return bool(getattr(cfg.dataset, "use_da3_pose", False))
+
+    def get_da3_pose_model(self) -> nn.Module:
+        if not self._da3_pose_model_holder:
+            from depth_anything_3.api import DepthAnything3
+
+            model = DepthAnything3.from_pretrained("depth-anything/DA3-SMALL")
+            model.eval()
+            model.requires_grad_(False)
+            self._da3_pose_model_holder.append(model)
+        return self._da3_pose_model_holder[0].to(self.device)
+
+    def apply_da3_pose(self, batch: BatchedExample) -> BatchedExample:
+        if not self.use_da3_pose():
+            return batch
+        if "da3_image" not in batch["context"] or "da3_image" not in batch["target"]:
+            raise KeyError("dataset.use_da3_pose requires context/target da3_image tensors")
+
+        da3_images = torch.cat(
+            [batch["context"]["da3_image"], batch["target"]["da3_image"]],
+            dim=1,
+        ).to(self.device)
+        _, _, _, height, width = da3_images.shape
+
+        model = self.get_da3_pose_model()
+        with torch.no_grad():
+            output = model(
+                da3_images,
+                extrinsics=None,
+                intrinsics=None,
+                export_feat_layers=[],
+                infer_gs=False,
+                use_ray_pose=False,
+                ref_view_strategy="saddle_balanced",
+            )
+
+        return replace_batch_poses_from_da3(
+            batch,
+            output["extrinsics"].to(batch["context"]["extrinsics"].device),
+            output["intrinsics"].to(batch["context"]["intrinsics"].device),
+            height=height,
+            width=width,
+        )
+
     def training_step(self, batch, batch_idx):
-        batch: BatchedExample = self.data_shim(batch)
+        batch: BatchedExample = self.apply_da3_pose(batch)
+        batch = self.data_shim(batch)
         _, _, _, h, w = batch["target"]["image"].shape
 
         # Run the model.
@@ -179,7 +228,8 @@ class ModelWrapper(LightningModule):
         return total_loss
 
     def test_step(self, batch, batch_idx):
-        batch: BatchedExample = self.data_shim(batch)
+        batch: BatchedExample = self.apply_da3_pose(batch)
+        batch = self.data_shim(batch)
         b, v, _, h, w = batch["target"]["image"].shape
         assert b == 1
 
@@ -295,7 +345,8 @@ class ModelWrapper(LightningModule):
 
     @rank_zero_only
     def validation_step(self, batch, batch_idx):
-        batch: BatchedExample = self.data_shim(batch)
+        batch: BatchedExample = self.apply_da3_pose(batch)
+        batch = self.data_shim(batch)
 
         if self.global_rank == 0:
             print(

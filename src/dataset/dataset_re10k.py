@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Literal
 
 import torch
+import torch.nn.functional as F
 import torchvision.transforms as tf
 from einops import rearrange, repeat
 from jaxtyping import Float, UInt8
@@ -37,6 +38,7 @@ class DatasetRE10kCfg(DatasetCfgCommon):
     far: float = -1.0
     baseline_scale_bounds: bool = True
     shuffle_val: bool = True
+    use_da3_pose: bool = False
 
 
 class DatasetRE10k(IterableDataset):
@@ -200,7 +202,33 @@ class DatasetRE10k(IterableDataset):
                 }
                 if self.stage == "train" and self.cfg.augment:
                     example = apply_augmentation_shim(example)
-                yield apply_crop_shim(example, tuple(self.cfg.image_shape))
+                example = apply_crop_shim(example, tuple(self.cfg.image_shape))
+                if self.cfg.use_da3_pose:
+                    example = self.add_da3_images(example)
+                yield example
+
+    def add_da3_images(self, example):
+        return {
+            **example,
+            "context": {
+                **example["context"],
+                "da3_image": self.prepare_da3_images(example["context"]["image"]),
+            },
+            "target": {
+                **example["target"],
+                "da3_image": self.prepare_da3_images(example["target"]["image"]),
+            },
+        }
+
+    def prepare_da3_images(
+        self,
+        images: Float[Tensor, "batch 3 height width"],
+    ) -> Float[Tensor, "batch 3 252 252"]:
+        shape = [*[1] * (images.dim() - 3), 3, 1, 1]
+        mean = torch.tensor([0.485, 0.456, 0.406]).reshape(*shape).to(images.device)
+        std = torch.tensor([0.229, 0.224, 0.225]).reshape(*shape).to(images.device)
+        images = (images - mean) / std
+        return F.interpolate(images, (252, 252), mode="bilinear", align_corners=True)
 
     def convert_poses(
         self,
